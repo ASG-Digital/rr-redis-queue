@@ -1,7 +1,4 @@
-package redis
-
-import "redis/lock"
+package redisqueue
 
 type Config struct {
-	Lock *lock.Config `mapstructure:"lock"`
 }

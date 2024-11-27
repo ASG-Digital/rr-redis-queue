@@ -1,4 +1,4 @@
-module redis
+module redisqueue
 
 go 1.22.6
 

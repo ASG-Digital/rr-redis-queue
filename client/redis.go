@@ -6,7 +6,7 @@ import (
 	"go.uber.org/zap"
 )
 
-func NewRedisDriver(log *zap.Logger, cfg *Config) (redis.UniversalClient, error) {
+func NewRedisClient(log *zap.Logger, cfg *Config) (redis.UniversalClient, error) {
 	tlsConfig, err := tlsConfig(cfg.TLSConfig)
 	if err != nil {
 		return nil, err

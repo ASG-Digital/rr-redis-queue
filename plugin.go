@@ -1,16 +1,14 @@
-package redis
+package redisqueue
 
 import (
 	"github.com/roadrunner-server/errors"
 	"go.uber.org/zap"
-	"redis/lock"
 )
 
-const PluginName string = "redis"
+const PluginName string = "redisqueue"
 
 type Plugin struct {
-	log  *zap.Logger
-	lock *lock.LockHandler
+	log *zap.Logger
 }
 
 type Configurer interface {
@@ -39,21 +37,9 @@ func (p *Plugin) Init(cfg Configurer, log Logger) error {
 
 	p.log = log.NamedLogger(PluginName)
 
-	if config.Lock != nil {
-		lockHandler, lErr := lock.NewLockHandler(config.Lock)
-		if lErr != nil {
-			return errors.E(op, lErr)
-		}
-		p.lock = lockHandler
-	}
-
 	return nil
 }
 
 func (p *Plugin) Name() string {
 	return PluginName
-}
-
-func (p *Plugin) LockEnabled() bool {
-	return p.lock != nil
 }
