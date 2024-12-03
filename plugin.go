@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	pluginName       string = "rr-redis-queue"
+	pluginName       string = "rr_redis_queue"
 	masterPluginName string = "jobs"
 )
 
