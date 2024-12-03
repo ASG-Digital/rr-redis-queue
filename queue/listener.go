@@ -1,0 +1,115 @@
+package queue
+
+import (
+	"context"
+	"errors"
+	"github.com/redis/go-redis/v9"
+	"github.com/roadrunner-server/events"
+	"go.uber.org/zap"
+	"sync/atomic"
+)
+
+const (
+	restartStr string = "restart"
+)
+
+func (d *Driver) listen() {
+	d.atomicCtx()
+
+	go func() {
+		d.pubSub = d.rdb.Subscribe(d.ctx, d.channel)
+		defer func() {
+			_ = d.pubSub.Close()
+		}()
+
+		ch := d.pubSub.Channel()
+
+		for {
+			select {
+			case <-d.ctx.Done():
+				atomic.StoreUint32(&d.listeners, 0)
+				d.log.Debug("listener stopped", zap.String("channel", d.channel))
+				return
+			case msg := <-ch:
+				if msg == nil {
+					d.log.Warn("received nil message, skipping")
+					continue
+				}
+
+				queueName := msg.Payload
+				d.log.Debug("received message", zap.String("queue", queueName))
+
+				err := d.processQueue(queueName)
+				if err != nil {
+					d.handleProcessingError(err, queueName)
+				}
+			}
+		}
+	}()
+}
+
+func (d *Driver) processQueue(queueName string) error {
+	queueKey := d.queuePrefix + "_" + queueName
+	tasks, err := d.rdb.ZPopMin(d.ctx, queueKey, int64(d.prefetchLimit)).Result()
+	if err != nil {
+		return err
+	}
+
+	if len(tasks) == 0 {
+		d.log.Debug("no tasks found in queue", zap.String("queue", queueName))
+		return nil
+	}
+
+	for _, task := range tasks {
+		taskID := task.Member.(string)
+		payload, err := d.rdb.Get(d.ctx, taskID).Result()
+		if err != nil {
+			d.log.Error("failed to fetch task payload", zap.String("taskID", taskID), zap.Error(err))
+			continue
+		}
+
+		headersJSON, _ := d.rdb.HGet(d.ctx, taskID, "headers").Result()
+		item := d.unpack(taskID, payload, headersJSON, task.Score, &d.pipeline, d.requeueTask, &d.stopped)
+
+		d.priorityQueue.Insert(item)
+		d.log.Debug("task pushed to priority queue", zap.Uint64("queue size", d.priorityQueue.Len()))
+	}
+
+	return nil
+}
+
+func (d *Driver) handleProcessingError(err error, queueName string) {
+	if errors.Is(err, context.Canceled) {
+		atomic.StoreUint32(&d.listeners, 0)
+		return
+	}
+
+	if errors.Is(err, redis.ErrClosed) {
+		if atomic.LoadUint32(&d.listeners) > 0 {
+			atomic.AddUint32(&d.listeners, ^uint32(0))
+		}
+		d.log.Debug("listener was stopped")
+		return
+	}
+
+	if atomic.LoadUint64(&d.stopped) == 1 {
+		return
+	}
+
+	pipe := (*d.pipeline.Load()).Name()
+	d.eventsChannel <- events.NewEvent(events.EventJOBSDriverCommand, pipe, restartStr)
+	d.log.Error("process error, restarting the pipeline", zap.Error(err), zap.String("pipeline", pipe))
+}
+
+func (d *Driver) atomicCtx() {
+	d.ctx, d.cancel = context.WithCancel(context.Background())
+}
+
+func (d *Driver) checkCtxAndCancel() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if atomic.LoadUint32(&d.listeners) == 0 && d.cancel != nil {
+		d.cancel()
+	}
+}
