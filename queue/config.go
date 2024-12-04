@@ -10,6 +10,7 @@ const (
 )
 
 type Config struct {
+	Connection      string `mapstructure:"connection"`
 	Channel         string `mapstructure:"channel"`
 	PrefetchLimit   int    `mapstructure:"prefetch_limit"`
 	VisibilityLimit int    `mapstructure:"visibility_timout"`

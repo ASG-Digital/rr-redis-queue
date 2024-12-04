@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	pluginName string = "redis_queue"
+	pluginName string = "redisqueue"
 	tracerName string = "jobs"
 )
 
@@ -65,7 +65,7 @@ func FromConfig(
 	cfg Configurer,
 	priorityQueue jobs.Queue,
 ) (*Driver, error) {
-	const op = errors.Op("redis_pub_sub_from_config")
+	const op = errors.Op("redisqueue_from_config")
 
 	if tracer == nil {
 		tracer = sdktrace.NewTracerProvider()
@@ -78,20 +78,27 @@ func FromConfig(
 		return nil, errors.E(op, errors.Errorf("No configuration found for key: %s", configKey))
 	}
 
-	var clientConf client.Config
-	err := cfg.UnmarshalKey(configKey, &clientConf)
-	if err != nil {
-		return nil, errors.E(op, fmt.Errorf("failed to parse Redis client configuration: %w", err))
-	}
-
-	clientConf.InitDefaults()
-
 	var queueConf Config
-	err = cfg.UnmarshalKey(configKey, &queueConf)
+	err := cfg.UnmarshalKey(configKey, &queueConf)
 	if err != nil {
 		return nil, errors.E(op, fmt.Errorf("failed to parse queue configuration: %w", err))
 	}
 	queueConf.InitDefaults()
+
+	var connections map[string]client.Config
+	if !cfg.Has("redisqueue.connections") {
+		return nil, errors.E(op, errors.Str("no Redis connections found in configuration"))
+	}
+	err = cfg.UnmarshalKey("redisqueue.connections", &connections)
+	if err != nil {
+		return nil, errors.E(op, fmt.Errorf("failed to parse Redis connections: %w", err))
+	}
+
+	clientConf, ok := connections[queueConf.Connection]
+	if !ok {
+		return nil, errors.E(op, fmt.Errorf("connection '%s' not found in global Redisqueue connections", queueConf.Connection))
+	}
+	clientConf.InitDefaults()
 
 	rdb, err := client.NewRedisClient(log, &clientConf)
 	if err != nil {
@@ -142,25 +149,28 @@ func FromPipeline(
 	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}, jprop.Jaeger{})
 	otel.SetTextMapPropagator(prop)
 
-	if !cfg.Has(pluginName) {
-		return nil, errors.E(op, errors.Str("no global redis_pub_sub configuration found"))
+	var connections map[string]client.Config
+	if !cfg.Has("requeue.connections") {
+		return nil, errors.E(op, errors.Str("no Redis connections found in configuration"))
 	}
-
-	var clientConf client.Config
-	err := cfg.UnmarshalKey(pluginName, &clientConf)
+	err := cfg.UnmarshalKey("redisqueue.connections", &connections)
 	if err != nil {
-		return nil, errors.E(op, fmt.Errorf("failed to parse Redis client configuration: %w", err))
+		return nil, errors.E(op, fmt.Errorf("failed to parse Redis connections: %w", err))
 	}
-	clientConf.InitDefaults()
 
 	var queueConf Config
-
-	queueConf.QueuePrefix = pipe.String("prefix", queueConf.QueuePrefix)
-	queueConf.Channel = pipe.String("channel", queueConf.Channel)
-	queueConf.PrefetchLimit = pipe.Int("prefetch_limit", queueConf.PrefetchLimit)
-	queueConf.VisibilityLimit = pipe.Int("visibility_limit", queueConf.VisibilityLimit)
-	queueConf.MaxRetries = pipe.Int("max_retries", queueConf.MaxRetries)
+	queueConf.Connection = pipe.String("connection", "")
+	queueConf.QueuePrefix = pipe.String("queue_prefix", "")
+	queueConf.Channel = pipe.String("channel", "")
+	queueConf.PrefetchLimit = pipe.Int("prefetch_limit", 10)
+	queueConf.VisibilityLimit = pipe.Int("visibility_limit", 30)
 	queueConf.InitDefaults()
+
+	clientConf, ok := connections[queueConf.Connection]
+	if !ok {
+		return nil, errors.E(op, fmt.Errorf("connection '%s' not found in global Redisqueue connections", queueConf.Connection))
+	}
+	clientConf.InitDefaults()
 
 	rdb, err := client.NewRedisClient(log, &clientConf)
 	if err != nil {
@@ -198,7 +208,7 @@ func FromPipeline(
 func (d *Driver) Push(ctx context.Context, jb jobs.Message) error {
 	const op = errors.Op("redis_pub_sub_push")
 
-	ctx, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redis_pub_sub_push")
+	ctx, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redisqueue_push")
 	defer span.End()
 
 	pipe := *d.pipeline.Load()
@@ -235,7 +245,7 @@ func (d *Driver) Push(ctx context.Context, jb jobs.Message) error {
 func (d *Driver) Run(ctx context.Context, p jobs.Pipeline) error {
 	const op = errors.Op("redis_pub_sub_run")
 
-	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redis_pub_sub_run")
+	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redisqueue_run")
 	defer span.End()
 
 	d.mu.Lock()
@@ -255,7 +265,7 @@ func (d *Driver) Run(ctx context.Context, p jobs.Pipeline) error {
 }
 
 func (d *Driver) State(ctx context.Context) (*jobs.State, error) {
-	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redis_pub_sub_state")
+	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redisqueue_state")
 	defer span.End()
 
 	pipe := *d.pipeline.Load()
@@ -277,7 +287,7 @@ func (d *Driver) State(ctx context.Context) (*jobs.State, error) {
 func (d *Driver) Pause(ctx context.Context, pipelineName string) error {
 	start := time.Now()
 
-	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redis_pub_sub_pause")
+	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redisqueue_pause")
 	defer span.End()
 
 	pipe := *d.pipeline.Load()
@@ -313,7 +323,7 @@ func (d *Driver) Pause(ctx context.Context, pipelineName string) error {
 func (d *Driver) Resume(ctx context.Context, pipelineName string) error {
 	start := time.Now().UTC()
 
-	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redis_pub_sub_resume")
+	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redisqueue_resume")
 	defer span.End()
 
 	d.mu.Lock()
@@ -352,7 +362,7 @@ func (d *Driver) Resume(ctx context.Context, pipelineName string) error {
 func (d *Driver) Stop(ctx context.Context) error {
 	start := time.Now().UTC()
 
-	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redis_pub_sub_stop")
+	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redisqueue_stop")
 	defer span.End()
 
 	d.log.Debug("stopping pipeline", zap.String("driver", pluginName), zap.Time("start", start))

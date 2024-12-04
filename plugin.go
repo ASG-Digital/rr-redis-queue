@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	pluginName       string = "rr_redis_queue"
+	pluginName       string = "redisqueue"
 	masterPluginName string = "jobs"
 )
 
@@ -42,6 +42,10 @@ func (p *Plugin) Init(log Logger, cfg Configurer) error {
 	p.cfg = cfg
 
 	return nil
+}
+
+func (p *Plugin) Name() string {
+	return pluginName
 }
 
 func (p *Plugin) Collects() []*dep.In {
