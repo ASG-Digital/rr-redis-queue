@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/redis/go-redis/v9"
 	"github.com/roadrunner-server/api/v4/plugins/v4/jobs"
@@ -206,7 +207,7 @@ func FromPipeline(
 }
 
 func (d *Driver) Push(ctx context.Context, jb jobs.Message) error {
-	const op = errors.Op("redis_pub_sub_push")
+	const op = errors.Op("redisqueue_push")
 
 	ctx, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redisqueue_push")
 	defer span.End()
@@ -216,17 +217,21 @@ func (d *Driver) Push(ctx context.Context, jb jobs.Message) error {
 		return errors.E(op, fmt.Errorf("pipeline does not exist: %s, actual: %s", jb.GroupID(), pipe.Name()))
 	}
 
-	taskID := fmt.Sprintf("%s%d", pipe.Name(), time.Now().UnixNano())
+	item := fromJob(jb)
+	redisStringData, err := json.Marshal(item)
+	if err != nil {
+		return errors.E(op, fmt.Errorf("failed to JSON encode payload: %w", err))
+	}
 
-	err := d.rdb.Set(ctx, taskID, jb.Payload(), 0).Err()
+	err = d.rdb.Set(ctx, item.ID(), redisStringData, 0).Err()
 	if err != nil {
 		return errors.E(op, fmt.Errorf("failed to store payload: %w", err))
 	}
 
-	queueKey := fmt.Sprintf("%s_tasks", pipe.Name())
+	queueKey := fmt.Sprintf("%s_%s", d.queuePrefix, pipe.Name())
 	err = d.rdb.ZAdd(ctx, queueKey, redis.Z{
 		Score:  float64(jb.Priority()),
-		Member: taskID,
+		Member: item.ID(),
 	}).Err()
 	if err != nil {
 		return errors.E(op, fmt.Errorf("failed to add task to sorted set: %w", err))
@@ -237,7 +242,7 @@ func (d *Driver) Push(ctx context.Context, jb jobs.Message) error {
 		return errors.E(op, fmt.Errorf("failed to publish queue name: %w", err))
 	}
 
-	d.log.Debug("Task pushed and queue notified", zap.String("queue", pipe.Name()), zap.String("taskID", taskID))
+	d.log.Debug("Task pushed and queue notified", zap.String("queue", pipe.Name()), zap.String("taskID", item.ID()))
 
 	return nil
 }

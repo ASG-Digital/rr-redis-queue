@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"github.com/redis/go-redis/v9"
 	"github.com/roadrunner-server/events"
@@ -17,13 +18,12 @@ func (d *Driver) listen() {
 	d.atomicCtx()
 
 	go func() {
+		d.log.Debug("subscribing to channel", zap.String("channel", d.channel))
 		d.pubSub = d.rdb.Subscribe(d.ctx, d.channel)
-		defer func() {
-			_ = d.pubSub.Close()
-		}()
-
+		defer func(pubSub *redis.PubSub) {
+			_ = pubSub.Close()
+		}(d.pubSub)
 		ch := d.pubSub.Channel()
-
 		for {
 			select {
 			case <-d.ctx.Done():
@@ -35,7 +35,6 @@ func (d *Driver) listen() {
 					d.log.Warn("received nil message, skipping")
 					continue
 				}
-
 				queueName := msg.Payload
 				d.log.Debug("received message", zap.String("queue", queueName))
 
@@ -62,16 +61,21 @@ func (d *Driver) processQueue(queueName string) error {
 
 	for _, task := range tasks {
 		taskID := task.Member.(string)
-		payload, err := d.rdb.Get(d.ctx, taskID).Result()
+		taskJson, err := d.rdb.Get(d.ctx, taskID).Result()
 		if err != nil {
 			d.log.Error("failed to fetch task payload", zap.String("taskID", taskID), zap.Error(err))
 			continue
 		}
 
-		headersJSON, _ := d.rdb.HGet(d.ctx, taskID, "headers").Result()
-		item := d.unpack(taskID, payload, headersJSON, task.Score, &d.pipeline, d.requeueTask, &d.stopped)
+		var item Item
 
-		d.priorityQueue.Insert(item)
+		err = json.Unmarshal([]byte(taskJson), &item)
+		if err != nil {
+			d.log.Debug("Unmarshalling failed")
+		}
+
+		d.addItemOptions(&item)
+		d.priorityQueue.Insert(&item)
 		d.log.Debug("task pushed to priority queue", zap.Uint64("queue size", d.priorityQueue.Len()))
 	}
 
@@ -92,6 +96,8 @@ func (d *Driver) handleProcessingError(err error, queueName string) {
 		return
 	}
 
+	atomic.StoreUint32(&d.listeners, 0)
+
 	if atomic.LoadUint64(&d.stopped) == 1 {
 		return
 	}
@@ -109,7 +115,7 @@ func (d *Driver) checkCtxAndCancel() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if atomic.LoadUint32(&d.listeners) == 0 && d.cancel != nil {
+	if d.cancel != nil {
 		d.cancel()
 	}
 }
