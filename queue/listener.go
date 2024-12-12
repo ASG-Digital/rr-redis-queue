@@ -64,18 +64,10 @@ func (d *Driver) listen() {
 
 func (d *Driver) processQueue(queueName string) error {
 	queueKey := d.queuePrefix + "_" + queueName
-	var unprocessedTasks []redis.Z
 
 	for {
 		select {
 		case <-d.ctx.Done():
-			if len(unprocessedTasks) > 0 {
-				d.log.Warn("context cancelled, reinserting unprocessed tasks", zap.String("queue", queueName), zap.Int("jobs_to_reinsert", len(unprocessedTasks)))
-				_, err := d.rdb.ZAdd(d.ctx, queueKey, unprocessedTasks...).Result()
-				if err != nil {
-					d.log.Error("failed to reinsert unprocessed tasks", zap.Error(err), zap.String("queue", queueName))
-				}
-			}
 			return d.ctx.Err()
 		default:
 			if d.priorityQueue.Len() >= uint64(d.prefetchLimit) {
@@ -101,7 +93,7 @@ func (d *Driver) processQueue(queueName string) error {
 				taskJson, err := d.rdb.Get(d.ctx, taskID).Result()
 				if err != nil {
 					d.log.Error("failed to fetch task payload", zap.String("taskID", taskID), zap.Error(err))
-					unprocessedTasks = append(unprocessedTasks, redis.Z{Score: task.Score, Member: task.Member})
+					d.rdb.Del(d.ctx, taskID)
 					continue
 				}
 
@@ -109,24 +101,14 @@ func (d *Driver) processQueue(queueName string) error {
 
 				err = json.Unmarshal([]byte(taskJson), &item)
 				if err != nil {
-					unprocessedTasks = append(unprocessedTasks, redis.Z{Score: task.Score, Member: task.Member})
 					d.log.Debug("Unmarshalling failed")
+					d.rdb.Del(d.ctx, taskID)
 					continue
 				}
 
 				d.addItemOptions(&item)
 				d.priorityQueue.Insert(&item)
 				d.log.Debug("task pushed to priority queue", zap.Uint64("queue size", d.priorityQueue.Len()))
-			}
-
-			if len(unprocessedTasks) > 0 {
-				_, err := d.rdb.ZAdd(d.ctx, queueKey, unprocessedTasks...).Result()
-				if err != nil {
-					d.log.Error("failed to reinsert unprocessed tasks", zap.Error(err), zap.String("queue", queueName))
-				} else {
-					d.log.Debug("reinserted unprocessed tasks", zap.String("queue", queueName), zap.Int("jobs_reinserted", len(unprocessedTasks)))
-				}
-				unprocessedTasks = nil
 			}
 		}
 	}
