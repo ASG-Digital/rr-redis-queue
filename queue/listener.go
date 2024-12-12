@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/redis/go-redis/v9"
 	"github.com/roadrunner-server/events"
 	"go.uber.org/zap"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -24,6 +26,12 @@ func (d *Driver) listen() {
 			_ = pubSub.Close()
 		}(d.pubSub)
 		ch := d.pubSub.Channel()
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+
+		pipe := *d.pipeline.Load()
+		queueName := fmt.Sprintf("%s_%s", d.queuePrefix, pipe.Name())
+
 		for {
 			select {
 			case <-d.ctx.Done():
@@ -35,14 +43,22 @@ func (d *Driver) listen() {
 					d.log.Warn("received nil message, skipping")
 					continue
 				}
-				queueName := msg.Payload
-				d.log.Debug("received message", zap.String("queue", queueName))
+				queueNameFromMessage := msg.Payload
+				d.log.Debug("received message", zap.String("queue", queueNameFromMessage))
+
+				err := d.processQueue(queueNameFromMessage)
+				if err != nil {
+					d.handleProcessingError(err, queueNameFromMessage)
+				}
+			case <-ticker.C:
+				d.log.Debug("ticker triggered, processing any pending tasks")
 
 				err := d.processQueue(queueName)
 				if err != nil {
 					d.handleProcessingError(err, queueName)
 				}
 			}
+
 		}
 	}()
 }
