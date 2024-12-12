@@ -64,37 +64,72 @@ func (d *Driver) listen() {
 
 func (d *Driver) processQueue(queueName string) error {
 	queueKey := d.queuePrefix + "_" + queueName
-	tasks, err := d.rdb.ZPopMin(d.ctx, queueKey, int64(d.prefetchLimit)).Result()
-	if err != nil {
-		return err
-	}
+	var unprocessedTasks []redis.Z
 
-	if len(tasks) == 0 {
-		d.log.Debug("no tasks found in queue", zap.String("queue", queueName))
-		return nil
-	}
+	for {
+		select {
+		case <-d.ctx.Done():
+			if len(unprocessedTasks) > 0 {
+				d.log.Warn("context cancelled, reinserting unprocessed tasks", zap.String("queue", queueName), zap.Int("jobs_to_reinsert", len(unprocessedTasks)))
+				_, err := d.rdb.ZAdd(d.ctx, queueKey, unprocessedTasks...).Result()
+				if err != nil {
+					d.log.Error("failed to reinsert unprocessed tasks", zap.Error(err), zap.String("queue", queueName))
+				}
+			}
+			return d.ctx.Err()
+		default:
+			if d.priorityQueue.Len() >= uint64(d.prefetchLimit) {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
 
-	for _, task := range tasks {
-		taskID := task.Member.(string)
-		taskJson, err := d.rdb.Get(d.ctx, taskID).Result()
-		if err != nil {
-			d.log.Error("failed to fetch task payload", zap.String("taskID", taskID), zap.Error(err))
-			continue
+			spaceAvailable := int64(d.prefetchLimit) - int64(d.priorityQueue.Len())
+
+			tasks, err := d.rdb.ZPopMin(d.ctx, queueKey, spaceAvailable).Result()
+			if err != nil {
+				return err
+			}
+
+			if len(tasks) == 0 {
+				d.log.Debug("no tasks found in queue", zap.String("queue", queueName))
+				return nil
+			}
+
+			for _, task := range tasks {
+				taskID := task.Member.(string)
+
+				taskJson, err := d.rdb.Get(d.ctx, taskID).Result()
+				if err != nil {
+					d.log.Error("failed to fetch task payload", zap.String("taskID", taskID), zap.Error(err))
+					unprocessedTasks = append(unprocessedTasks, redis.Z{Score: task.Score, Member: task.Member})
+					continue
+				}
+
+				var item Item
+
+				err = json.Unmarshal([]byte(taskJson), &item)
+				if err != nil {
+					unprocessedTasks = append(unprocessedTasks, redis.Z{Score: task.Score, Member: task.Member})
+					d.log.Debug("Unmarshalling failed")
+					continue
+				}
+
+				d.addItemOptions(&item)
+				d.priorityQueue.Insert(&item)
+				d.log.Debug("task pushed to priority queue", zap.Uint64("queue size", d.priorityQueue.Len()))
+			}
+
+			if len(unprocessedTasks) > 0 {
+				_, err := d.rdb.ZAdd(d.ctx, queueKey, unprocessedTasks...).Result()
+				if err != nil {
+					d.log.Error("failed to reinsert unprocessed tasks", zap.Error(err), zap.String("queue", queueName))
+				} else {
+					d.log.Debug("reinserted unprocessed tasks", zap.String("queue", queueName), zap.Int("jobs_reinserted", len(unprocessedTasks)))
+				}
+				unprocessedTasks = nil
+			}
 		}
-
-		var item Item
-
-		err = json.Unmarshal([]byte(taskJson), &item)
-		if err != nil {
-			d.log.Debug("Unmarshalling failed")
-		}
-
-		d.addItemOptions(&item)
-		d.priorityQueue.Insert(&item)
-		d.log.Debug("task pushed to priority queue", zap.Uint64("queue size", d.priorityQueue.Len()))
 	}
-
-	return nil
 }
 
 func (d *Driver) handleProcessingError(err error, queueName string) {
