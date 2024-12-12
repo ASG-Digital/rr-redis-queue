@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"github.com/redis/go-redis/v9"
 	"github.com/roadrunner-server/events"
 	"go.uber.org/zap"
@@ -30,7 +29,7 @@ func (d *Driver) listen() {
 		defer ticker.Stop()
 
 		pipe := *d.pipeline.Load()
-		queueName := fmt.Sprintf("%s_%s", d.queuePrefix, pipe.Name())
+		queueName := pipe.Name()
 
 		for {
 			select {
