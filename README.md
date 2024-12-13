@@ -13,7 +13,7 @@ This queue implementation is inspired by the code found here: https://github.com
 
 ## Config
 
-```
+```yaml
 redisqueue:
     connections:
         conn1:
