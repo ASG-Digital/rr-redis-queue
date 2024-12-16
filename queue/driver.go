@@ -46,6 +46,7 @@ type Driver struct {
 	prefetchLimit   int
 	maxRetries      int
 	queuePrefix     string
+	tickerInterval  time.Duration
 
 	eventsChannel chan events.Event
 	eventBus      *events.Bus
@@ -122,6 +123,7 @@ func FromConfig(
 		prefetchLimit:   queueConf.PrefetchLimit,
 		maxRetries:      queueConf.MaxRetries,
 		queuePrefix:     queueConf.QueuePrefix,
+		tickerInterval:  queueConf.TickerInterval,
 		eventsChannel:   eventsChannel,
 		eventBus:        eventBus,
 		id:              id,
@@ -165,6 +167,22 @@ func FromPipeline(
 	queueConf.Channel = pipe.String("channel", "")
 	queueConf.PrefetchLimit = pipe.Int("prefetch_limit", 10)
 	queueConf.VisibilityLimit = pipe.Int("visibility_limit", 30)
+
+	tickerIntervalStr := pipe.String("ticker_interval", "")
+	var tickerInterval time.Duration
+
+	if tickerIntervalStr == "" {
+		tickerInterval = 0
+	} else {
+		duration, err := time.ParseDuration(tickerIntervalStr)
+		if err != nil {
+			return nil, errors.E(op, fmt.Errorf("invalid ticker_interval format: %w", err))
+		}
+		tickerInterval = duration
+	}
+
+	queueConf.TickerInterval = tickerInterval
+
 	queueConf.InitDefaults()
 
 	clientConf, ok := connections[queueConf.Connection]

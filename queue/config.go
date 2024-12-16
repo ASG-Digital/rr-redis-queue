@@ -1,5 +1,7 @@
 package queue
 
+import "time"
+
 const (
 	channelKey           string = "channel"
 	visibilityTimeoutKey string = "visibility_timeout"
@@ -10,13 +12,14 @@ const (
 )
 
 type Config struct {
-	Connection      string `mapstructure:"connection"`
-	Channel         string `mapstructure:"channel"`
-	PrefetchLimit   int    `mapstructure:"prefetch_limit"`
-	VisibilityLimit int    `mapstructure:"visibility_timout"`
-	MaxRetries      int    `mapstructure:"max_retries"`
-	QueuePrefix     string `mapstructure:"prefix"`
-	Priority        int    `mapstructure:"priority"`
+	Connection      string        `mapstructure:"connection"`
+	Channel         string        `mapstructure:"channel"`
+	PrefetchLimit   int           `mapstructure:"prefetch_limit"`
+	VisibilityLimit int           `mapstructure:"visibility_timout"`
+	MaxRetries      int           `mapstructure:"max_retries"`
+	QueuePrefix     string        `mapstructure:"prefix"`
+	Priority        int           `mapstructure:"priority"`
+	TickerInterval  time.Duration `mapstructure:"ticker_interval"`
 }
 
 func (c *Config) InitDefaults() {
@@ -38,5 +41,9 @@ func (c *Config) InitDefaults() {
 
 	if c.Channel == "" {
 		c.Channel = "queue_channel"
+	}
+
+	if c.TickerInterval <= 0 {
+		c.TickerInterval = time.Minute
 	}
 }

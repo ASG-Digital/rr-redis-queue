@@ -25,7 +25,7 @@ func (d *Driver) listen() {
 			_ = pubSub.Close()
 		}(d.pubSub)
 		ch := d.pubSub.Channel()
-		ticker := time.NewTicker(1 * time.Minute)
+		ticker := time.NewTicker(d.tickerInterval)
 		defer ticker.Stop()
 
 		pipe := *d.pipeline.Load()
