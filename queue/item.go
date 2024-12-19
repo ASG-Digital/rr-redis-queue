@@ -8,6 +8,7 @@ import (
 	"github.com/roadrunner-server/api/v4/plugins/v4/jobs"
 	"github.com/roadrunner-server/errors"
 	"go.uber.org/zap"
+	"maps"
 	"sync/atomic"
 	"time"
 )
@@ -23,12 +24,12 @@ type Item struct {
 }
 
 type Options struct {
-	Priority  int64                                       `json:"priority"`
-	Pipeline  string                                      `json:"pipeline,omitempty"`
-	Delay     int64                                       `json:"delay,omitempty"`
-	AutoAck   bool                                        `json:"auto_ack"`
-	Queue     string                                      `json:"queue,omitempty"`
-	RequeueFn func(ctx context.Context, item *Item) error `json:"-"`
+	Priority  int64  `json:"priority"`
+	Pipeline  string `json:"pipeline,omitempty"`
+	Delay     int64  `json:"delay,omitempty"`
+	AutoAck   bool   `json:"auto_ack"`
+	Queue     string `json:"queue,omitempty"`
+	requeueFn func(ctx context.Context, item *Item) error
 	stopped   *uint64
 	rdb       redis.UniversalClient
 	ctx       context.Context
@@ -104,6 +105,7 @@ func (i *Item) Ack() error {
 }
 
 func (i *Item) Nack() error {
+	i.Options.log.Debug("Task negatively acknowledged with", zap.String("taskID", i.ID()))
 	if atomic.LoadUint64(i.Options.stopped) == 1 {
 		return errors.Str("failed to negatively acknowledge the job, the pipeline is probably stopped")
 	}
@@ -111,6 +113,7 @@ func (i *Item) Nack() error {
 }
 
 func (i *Item) NackWithOptions(requeue bool, _ int) error {
+	i.Options.log.Debug("Task negatively acknowledged (with options) with", zap.String("taskID", i.ID()))
 	if requeue {
 		return i.Requeue(nil, 0)
 	}
@@ -126,12 +129,12 @@ func (i *Item) Requeue(headers map[string][]string, _ int) error {
 		i.headers = make(map[string][]string)
 	}
 
-	for key, value := range headers {
-		i.headers[key] = value
+	if len(headers) > 0 {
+		maps.Copy(i.headers, headers)
 	}
 
-	if i.Options.RequeueFn != nil {
-		return i.Options.RequeueFn(context.Background(), i)
+	if i.Options.requeueFn != nil {
+		return i.Options.requeueFn(context.Background(), i)
 	}
 	return nil
 }
@@ -166,6 +169,6 @@ func (d *Driver) addItemOptions(
 	item.Options.rdb = d.rdb
 	item.Options.ctx = d.ctx
 	item.Options.log = d.log
-	item.Options.RequeueFn = d.requeueTask
+	item.Options.requeueFn = d.handlePush
 	item.Options.stopped = &d.stopped
 }

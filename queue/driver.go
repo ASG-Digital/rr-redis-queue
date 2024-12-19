@@ -236,6 +236,7 @@ func (d *Driver) Push(ctx context.Context, jb jobs.Message) error {
 	}
 
 	item := fromJob(jb)
+	d.log.Debug("item autoack set to", zap.Bool("autoAck", item.Options.AutoAck))
 	redisStringData, err := json.Marshal(item)
 	if err != nil {
 		return errors.E(op, fmt.Errorf("failed to JSON encode payload: %w", err))
@@ -246,23 +247,7 @@ func (d *Driver) Push(ctx context.Context, jb jobs.Message) error {
 		return errors.E(op, fmt.Errorf("failed to store payload: %w", err))
 	}
 
-	queueKey := fmt.Sprintf("%s_%s", d.queuePrefix, pipe.Name())
-	err = d.rdb.ZAdd(ctx, queueKey, redis.Z{
-		Score:  float64(jb.Priority()),
-		Member: item.ID(),
-	}).Err()
-	if err != nil {
-		return errors.E(op, fmt.Errorf("failed to add task to sorted set: %w", err))
-	}
-
-	err = d.rdb.Publish(ctx, d.channel, pipe.Name()).Err()
-	if err != nil {
-		return errors.E(op, fmt.Errorf("failed to publish queue name: %w", err))
-	}
-
-	d.log.Debug("Task pushed and queue notified", zap.String("queue", pipe.Name()), zap.String("taskID", item.ID()))
-
-	return nil
+	return d.handlePush(ctx, item)
 }
 
 func (d *Driver) Run(ctx context.Context, p jobs.Pipeline) error {
@@ -415,17 +400,22 @@ func (d *Driver) Stop(ctx context.Context) error {
 	return nil
 }
 
-func (d *Driver) requeueTask(ctx context.Context, item *Item) error {
-	queueKey := fmt.Sprintf("%s_%s", d.queuePrefix, item.GroupID())
-
+func (d *Driver) handlePush(ctx context.Context, job *Item) error {
+	queueKey := fmt.Sprintf("%s_%s", d.queuePrefix, job.GroupID())
 	err := d.rdb.ZAdd(ctx, queueKey, redis.Z{
-		Score:  float64(item.Priority()),
-		Member: item.ID(),
+		Score:  float64(job.Priority()),
+		Member: job.ID(),
 	}).Err()
 	if err != nil {
-		return fmt.Errorf("failed to requeue task: %w", err)
+		return err
 	}
 
-	d.log.Debug("task requeued", zap.String("queue", queueKey), zap.String("taskID", item.ID()))
+	err = d.rdb.Publish(ctx, d.channel, job.GroupID()).Err()
+	if err != nil {
+		return err
+	}
+
+	d.log.Debug("Task pushed and queue notified", zap.String("queue", job.GroupID()), zap.String("taskID", job.ID()))
+
 	return nil
 }
