@@ -153,7 +153,7 @@ func FromPipeline(
 	otel.SetTextMapPropagator(prop)
 
 	var connections map[string]client.Config
-	if !cfg.Has("requeue.connections") {
+	if !cfg.Has("redisqueue.connections") {
 		return nil, errors.E(op, errors.Str("no Redis connections found in configuration"))
 	}
 	err := cfg.UnmarshalKey("redisqueue.connections", &connections)
