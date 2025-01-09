@@ -16,11 +16,11 @@ import (
 var _ jobs.Job = (*Item)(nil)
 
 type Item struct {
-	Job     string `json:"job"`
-	Ident   string `json:"id"`
-	Payload []byte `json:"payload"`
-	headers map[string][]string
-	Options *Options `json:"options,omitempty"`
+	Job        string              `json:"job"`
+	Ident      string              `json:"id"`
+	Payload    []byte              `json:"payload"`
+	HeadersMap map[string][]string `json:"headers,omitempty"`
+	Options    *Options            `json:"options,omitempty"`
 }
 
 type Options struct {
@@ -57,7 +57,7 @@ func (i *Item) Body() []byte {
 }
 
 func (i *Item) Headers() map[string][]string {
-	return i.headers
+	return i.HeadersMap
 }
 
 func (i *Item) Context() ([]byte, error) {
@@ -73,7 +73,7 @@ func (i *Item) Context() ([]byte, error) {
 		Job:      i.Job,
 		Driver:   pluginName,
 		Queue:    i.Options.Queue,
-		Headers:  i.headers,
+		Headers:  i.HeadersMap,
 		Pipeline: i.Options.Pipeline,
 	})
 }
@@ -125,12 +125,12 @@ func (i *Item) Requeue(headers map[string][]string, _ int) error {
 		return errors.Str("failed to requeue the job, the pipeline is probably stopped")
 	}
 
-	if i.headers == nil {
-		i.headers = make(map[string][]string)
+	if i.HeadersMap == nil {
+		i.HeadersMap = make(map[string][]string)
 	}
 
 	if len(headers) > 0 {
-		maps.Copy(i.headers, headers)
+		maps.Copy(i.HeadersMap, headers)
 	}
 
 	if i.Options.requeueFn != nil {
@@ -150,10 +150,10 @@ func fromJob(job jobs.Message) *Item {
 	}
 
 	return &Item{
-		Job:     job.Name(),
-		Ident:   job.ID(),
-		Payload: job.Payload(),
-		headers: headers,
+		Job:        job.Name(),
+		Ident:      job.ID(),
+		Payload:    job.Payload(),
+		HeadersMap: headers,
 		Options: &Options{
 			Priority: job.Priority(),
 			Pipeline: job.GroupID(),
@@ -169,6 +169,6 @@ func (d *Driver) addItemOptions(
 	item.Options.rdb = d.rdb
 	item.Options.ctx = d.ctx
 	item.Options.log = d.log
-	item.Options.requeueFn = d.handlePush
+	item.Options.requeueFn = d.handleRequeue
 	item.Options.stopped = &d.stopped
 }

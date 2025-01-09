@@ -419,3 +419,18 @@ func (d *Driver) handlePush(ctx context.Context, job *Item) error {
 
 	return nil
 }
+
+func (d *Driver) handleRequeue(ctx context.Context, job *Item) error {
+	const op = errors.Op("redisqueue_requeue")
+	d.log.Debug("item autoack set to", zap.Bool("autoAck", job.Options.AutoAck))
+	redisStringData, err := json.Marshal(job)
+	if err != nil {
+		return errors.E(op, fmt.Errorf("failed to JSON encode payload: %w", err))
+	}
+
+	err = d.rdb.Set(ctx, job.ID(), redisStringData, 0).Err()
+	if err != nil {
+		return errors.E(op, fmt.Errorf("failed to update payload: %w", err))
+	}
+	return d.handlePush(ctx, job)
+}
