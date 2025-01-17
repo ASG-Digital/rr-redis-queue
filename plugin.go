@@ -34,7 +34,7 @@ type Tracer interface {
 }
 
 func (p *Plugin) Init(log Logger, cfg Configurer) error {
-	if !cfg.Has(pluginName) && !cfg.Has(masterPluginName) {
+	if !cfg.Has(masterPluginName) || !cfg.Has(pluginName) {
 		return errors.E(errors.Disabled)
 	}
 
