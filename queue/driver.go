@@ -4,20 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"redisqueue/client"
+
 	"github.com/redis/go-redis/v9"
 	"github.com/roadrunner-server/api/v4/plugins/v4/jobs"
 	"github.com/roadrunner-server/errors"
-	"github.com/roadrunner-server/events"
 	jprop "go.opentelemetry.io/contrib/propagators/jaeger"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
-	"redisqueue/client"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 const (
@@ -39,22 +39,18 @@ type Driver struct {
 	priorityQueue jobs.Queue
 	pipeline      atomic.Pointer[jobs.Pipeline]
 	tracer        *sdktrace.TracerProvider
-	prop          propagation.TextMapPropagator
 
 	channel         string
 	visibilityLimit int
 	prefetchLimit   int
 	maxRetries      int
+	retryDelay      int
+	deadLetterTTL   int
 	queuePrefix     string
 	tickerInterval  time.Duration
 
-	eventsChannel chan events.Event
-	eventBus      *events.Bus
-	id            string
-	ctx           context.Context
-	cancel        context.CancelFunc
+	cancel context.CancelFunc
 
-	pubSub    *redis.PubSub
 	listeners uint32
 	stopped   uint64
 }
@@ -77,7 +73,7 @@ func FromConfig(
 	otel.SetTextMapPropagator(prop)
 
 	if !cfg.Has(configKey) {
-		return nil, errors.E(op, errors.Errorf("No configuration found for key: %s", configKey))
+		return nil, errors.E(op, errors.Errorf("no configuration found for key: %s", configKey))
 	}
 
 	var queueConf Config
@@ -107,28 +103,19 @@ func FromConfig(
 		return nil, errors.E(op, fmt.Errorf("failed to initialize Redis client: %w", err))
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-
-	eventsChannel := make(chan events.Event, 1)
-	eventBus, id := events.NewEventBus()
-
 	driver := &Driver{
 		log:             log,
 		rdb:             rdb,
 		priorityQueue:   priorityQueue,
 		tracer:          tracer,
-		prop:            prop,
 		channel:         queueConf.Channel,
 		visibilityLimit: queueConf.VisibilityLimit,
 		prefetchLimit:   queueConf.PrefetchLimit,
 		maxRetries:      queueConf.MaxRetries,
+		retryDelay:      queueConf.RetryDelay,
+		deadLetterTTL:   queueConf.DeadLetterTTL,
 		queuePrefix:     queueConf.QueuePrefix,
 		tickerInterval:  queueConf.TickerInterval,
-		eventsChannel:   eventsChannel,
-		eventBus:        eventBus,
-		id:              id,
-		ctx:             ctx,
-		cancel:          cancel,
 	}
 
 	driver.pipeline.Store(&pipe)
@@ -163,12 +150,15 @@ func FromPipeline(
 
 	var queueConf Config
 	queueConf.Connection = pipe.String("connection", "")
-	queueConf.QueuePrefix = pipe.String("queue_prefix", "")
-	queueConf.Channel = pipe.String("channel", "")
-	queueConf.PrefetchLimit = pipe.Int("prefetch_limit", 10)
-	queueConf.VisibilityLimit = pipe.Int("visibility_limit", 30)
+	queueConf.QueuePrefix = pipe.String(queuePrefixKey, "")
+	queueConf.Channel = pipe.String(channelKey, "")
+	queueConf.PrefetchLimit = pipe.Int(prefetchLimitKey, 10)
+	queueConf.VisibilityLimit = pipe.Int(visibilityTimeoutKey, 30)
+	queueConf.MaxRetries = pipe.Int(maxRetriesKey, 1)
+	queueConf.RetryDelay = pipe.Int(retryDelayKey, 5)
+	queueConf.DeadLetterTTL = pipe.Int(deadLetterTTLKey, 7*24*60*60)
 
-	tickerIntervalStr := pipe.String("ticker_interval", "")
+	tickerIntervalStr := pipe.String(tickerIntervalKey, "")
 	var tickerInterval time.Duration
 
 	if tickerIntervalStr == "" {
@@ -196,27 +186,19 @@ func FromPipeline(
 		return nil, errors.E(op, fmt.Errorf("failed to initialize Redis client: %w", err))
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-
-	eventsChannel := make(chan events.Event, 1)
-	eventBus, id := events.NewEventBus()
-
 	driver := &Driver{
 		log:             log,
 		rdb:             rdb,
 		tracer:          tracer,
-		prop:            prop,
 		priorityQueue:   priorityQueue,
 		channel:         queueConf.Channel,
 		visibilityLimit: queueConf.VisibilityLimit,
 		prefetchLimit:   queueConf.PrefetchLimit,
 		maxRetries:      queueConf.MaxRetries,
+		retryDelay:      queueConf.RetryDelay,
+		deadLetterTTL:   queueConf.DeadLetterTTL,
 		queuePrefix:     queueConf.QueuePrefix,
-		ctx:             ctx,
-		cancel:          cancel,
-		eventsChannel:   eventsChannel,
-		eventBus:        eventBus,
-		id:              id,
+		tickerInterval:  queueConf.TickerInterval,
 	}
 
 	driver.pipeline.Store(&pipe)
@@ -227,7 +209,7 @@ func FromPipeline(
 func (d *Driver) Push(ctx context.Context, jb jobs.Message) error {
 	const op = errors.Op("redisqueue_push")
 
-	ctx, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redisqueue_push")
+	ctx, span := d.tracer.Tracer(tracerName).Start(ctx, "redisqueue_push")
 	defer span.End()
 
 	pipe := *d.pipeline.Load()
@@ -242,29 +224,51 @@ func (d *Driver) Push(ctx context.Context, jb jobs.Message) error {
 		return errors.E(op, fmt.Errorf("failed to JSON encode payload: %w", err))
 	}
 
-	err = d.rdb.Set(ctx, item.ID(), redisStringData, 0).Err()
+	result, err := d.store(ctx, item, string(redisStringData))
 	if err != nil {
-		return errors.E(op, fmt.Errorf("failed to store payload: %w", err))
+		return errors.E(op, fmt.Errorf("failed to atomically store task: %w", err))
 	}
 
-	return d.handlePush(ctx, item)
+	if result == transitionResultTerminal {
+		return errors.E(op, fmt.Errorf("refusing to overwrite orphaned payload for task %s", item.ID()))
+	}
+
+	if result == transitionResultNoop {
+		d.log.Debug("duplicate task push ignored", zap.String("taskID", item.ID()))
+		return nil
+	}
+
+	if item.Options.DelayDuration() <= 0 {
+		if publishError := d.rdb.Publish(ctx, d.channel, item.GroupID()).Err(); publishError != nil {
+			d.log.Warn("task stored but queue notification failed", zap.String("taskID", item.ID()), zap.Error(publishError))
+		}
+	}
+
+	d.log.Debug("task stored", zap.String("queue", item.GroupID()), zap.String("taskID", item.ID()))
+
+	return nil
 }
 
 func (d *Driver) Run(ctx context.Context, p jobs.Pipeline) error {
 	const op = errors.Op("redis_pub_sub_run")
 
-	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redisqueue_run")
+	_, span := d.tracer.Tracer(tracerName).Start(ctx, "redisqueue_run")
 	defer span.End()
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if atomic.LoadUint64(&d.stopped) == 1 {
+		return errors.E(op, errors.Str("pipeline is stopped"))
+	}
 
 	pipe := *d.pipeline.Load()
 	if pipe.Name() != p.Name() {
 		return errors.E(op, fmt.Errorf("no such pipeline registered: %s", pipe.Name()))
 	}
 
-	atomic.AddUint32(&d.listeners, 1)
+	if !atomic.CompareAndSwapUint32(&d.listeners, 0, 1) {
+		return errors.E(op, errors.Str("listener is already in the active state"))
+	}
 	d.listen()
 
 	d.log.Debug("Pipeline started", zap.String("pipeline", p.Name()))
@@ -273,30 +277,43 @@ func (d *Driver) Run(ctx context.Context, p jobs.Pipeline) error {
 }
 
 func (d *Driver) State(ctx context.Context) (*jobs.State, error) {
-	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redisqueue_state")
+	_, span := d.tracer.Tracer(tracerName).Start(ctx, "redisqueue_state")
 	defer span.End()
 
 	pipe := *d.pipeline.Load()
 
-	active := int64(0)
-	if atomic.LoadUint32(&d.listeners) == 1 {
-		active = 1
+	keys := d.keys(pipe.Name())
+	delayed, err := d.rdb.ZCard(ctx, keys.delayed).Result()
+	if err != nil {
+		return nil, err
+	}
+	reserved, err := d.rdb.ZCard(ctx, keys.reserved).Result()
+	if err != nil {
+		return nil, err
+	}
+	ready, err := d.rdb.ZCard(ctx, keys.ready).Result()
+	if err != nil {
+		return nil, err
 	}
 
 	return &jobs.State{
 		Pipeline: pipe.Name(),
 		Driver:   pluginName,
 		Queue:    d.channel,
-		Active:   active,
-		Ready:    d.priorityQueue.Len() > 0,
+		Active:   reserved,
+		Delayed:  delayed,
+		Reserved: ready,
+		Ready:    atomic.LoadUint32(&d.listeners) == 1,
 	}, nil
 }
 
 func (d *Driver) Pause(ctx context.Context, pipelineName string) error {
 	start := time.Now()
 
-	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redisqueue_pause")
+	_, span := d.tracer.Tracer(tracerName).Start(ctx, "redisqueue_pause")
 	defer span.End()
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
 	pipe := *d.pipeline.Load()
 	if pipe.Name() != pipelineName {
@@ -315,7 +332,10 @@ func (d *Driver) Pause(ctx context.Context, pipelineName string) error {
 		zap.Time("start", start),
 	)
 
-	d.checkCtxAndCancel()
+	if d.cancel != nil {
+		d.cancel()
+		d.cancel = nil
+	}
 	atomic.StoreUint32(&d.listeners, 0)
 
 	d.log.Debug("pipeline was paused",
@@ -331,11 +351,14 @@ func (d *Driver) Pause(ctx context.Context, pipelineName string) error {
 func (d *Driver) Resume(ctx context.Context, pipelineName string) error {
 	start := time.Now().UTC()
 
-	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redisqueue_resume")
+	_, span := d.tracer.Tracer(tracerName).Start(ctx, "redisqueue_resume")
 	defer span.End()
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if atomic.LoadUint64(&d.stopped) == 1 {
+		return errors.Str("pipeline is stopped")
+	}
 
 	pipe := *d.pipeline.Load()
 	if pipe.Name() != pipelineName {
@@ -353,9 +376,10 @@ func (d *Driver) Resume(ctx context.Context, pipelineName string) error {
 		zap.Time("start", start),
 	)
 
-	d.atomicCtx()
+	if !atomic.CompareAndSwapUint32(&d.listeners, 0, 1) {
+		return errors.Str("listener is already in the active state")
+	}
 	d.listen()
-	atomic.StoreUint32(&d.listeners, 1)
 
 	d.log.Debug("pipeline was resumed",
 		zap.String("driver", pipe.Driver()),
@@ -370,26 +394,24 @@ func (d *Driver) Resume(ctx context.Context, pipelineName string) error {
 func (d *Driver) Stop(ctx context.Context) error {
 	start := time.Now().UTC()
 
-	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "redisqueue_stop")
+	_, span := d.tracer.Tracer(tracerName).Start(ctx, "redisqueue_stop")
 	defer span.End()
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
 	d.log.Debug("stopping pipeline", zap.String("driver", pluginName), zap.Time("start", start))
 
-	d.checkCtxAndCancel()
-
-	if d.pubSub != nil {
-		err := d.pubSub.Close()
-		if err != nil {
-			d.log.Warn("failed to close Pub/Sub subscription", zap.Error(err))
-		}
+	atomic.StoreUint64(&d.stopped, 1)
+	atomic.StoreUint32(&d.listeners, 0)
+	if d.cancel != nil {
+		d.cancel()
+		d.cancel = nil
 	}
 
 	err := d.rdb.Close()
 	if err != nil {
 		d.log.Warn("failed to close Redis client", zap.Error(err))
 	}
-
-	atomic.StoreUint64(&d.stopped, 1)
 
 	d.log.Debug("pipeline was stopped",
 		zap.String("driver", pluginName),
@@ -400,37 +422,31 @@ func (d *Driver) Stop(ctx context.Context) error {
 	return nil
 }
 
-func (d *Driver) handlePush(ctx context.Context, job *Item) error {
-	queueKey := fmt.Sprintf("%s_%s", d.queuePrefix, job.GroupID())
-	err := d.rdb.ZAdd(ctx, queueKey, redis.Z{
-		Score:  float64(job.Priority()),
-		Member: job.ID(),
-	}).Err()
-	if err != nil {
-		return err
-	}
-
-	err = d.rdb.Publish(ctx, d.channel, job.GroupID()).Err()
-	if err != nil {
-		return err
-	}
-
-	d.log.Debug("Task pushed and queue notified", zap.String("queue", job.GroupID()), zap.String("taskID", job.ID()))
-
-	return nil
-}
-
-func (d *Driver) handleRequeue(ctx context.Context, job *Item) error {
+func (d *Driver) handleRequeue(ctx context.Context, job *Item, delay int) error {
 	const op = errors.Op("redisqueue_requeue")
-	d.log.Debug("item autoack set to", zap.Bool("autoAck", job.Options.AutoAck))
 	redisStringData, err := json.Marshal(job)
 	if err != nil {
 		return errors.E(op, fmt.Errorf("failed to JSON encode payload: %w", err))
 	}
 
-	err = d.rdb.Set(ctx, job.ID(), redisStringData, 0).Err()
+	result, err := d.requeue(ctx, job, string(redisStringData), delay)
 	if err != nil {
-		return errors.E(op, fmt.Errorf("failed to update payload: %w", err))
+		return errors.E(op, fmt.Errorf("failed to atomically requeue task: %w", err))
 	}
-	return d.handlePush(ctx, job)
+
+	if result == transitionResultApplied && delay <= 0 {
+		if publishError := d.rdb.Publish(ctx, d.channel, job.GroupID()).Err(); publishError != nil {
+			d.log.Warn("task requeued but queue notification failed", zap.String("taskID", job.ID()), zap.Error(publishError))
+		}
+	}
+
+	if result == transitionResultNoop {
+		d.log.Warn("stale task requeue ignored", zap.String("taskID", job.ID()))
+	}
+
+	if result == transitionResultTerminal {
+		d.log.Error("task exhausted its delivery limit and was dead-lettered", zap.String("taskID", job.ID()))
+	}
+
+	return nil
 }

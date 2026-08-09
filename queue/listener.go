@@ -3,28 +3,25 @@ package queue
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"github.com/redis/go-redis/v9"
-	"github.com/roadrunner-server/events"
-	"go.uber.org/zap"
-	"sync/atomic"
 	"time"
-)
 
-const (
-	restartStr string = "restart"
+	"go.uber.org/zap"
 )
 
 func (d *Driver) listen() {
-	d.atomicCtx()
+	listenerContext, cancel := context.WithCancel(context.Background())
+	d.cancel = cancel
 
-	go func() {
+	go func(ctx context.Context) {
 		d.log.Debug("subscribing to channel", zap.String("channel", d.channel))
-		d.pubSub = d.rdb.Subscribe(d.ctx, d.channel)
-		defer func(pubSub *redis.PubSub) {
-			_ = pubSub.Close()
-		}(d.pubSub)
-		ch := d.pubSub.Channel()
+		pubSub := d.rdb.Subscribe(ctx, d.channel)
+		messages := pubSub.Channel()
+		defer func() {
+			if pubSub != nil {
+				_ = pubSub.Close()
+			}
+		}()
+
 		ticker := time.NewTicker(d.tickerInterval)
 		defer ticker.Stop()
 
@@ -33,121 +30,102 @@ func (d *Driver) listen() {
 
 		for {
 			select {
-			case <-d.ctx.Done():
-				atomic.StoreUint32(&d.listeners, 0)
+			case <-ctx.Done():
 				d.log.Debug("listener stopped", zap.String("channel", d.channel))
 				return
-			case msg := <-ch:
-				if msg == nil {
-					d.log.Warn("received nil message, skipping")
+			case msg, open := <-messages:
+				if !open {
+					d.log.Warn("Redis Pub/Sub channel closed; durable polling remains active")
+					if pubSub != nil {
+						_ = pubSub.Close()
+					}
+					pubSub = nil
+					messages = nil
 					continue
 				}
-				queueNameFromMessage := msg.Payload
-				d.log.Debug("received message", zap.String("queue", queueNameFromMessage))
+				if msg == nil {
+					d.log.Warn("received nil Redis Pub/Sub message")
+					continue
+				}
+				if msg.Payload != queueName {
+					d.log.Warn("ignoring notification for another queue",
+						zap.String("expected_queue", queueName),
+						zap.String("received_queue", msg.Payload),
+					)
+					continue
+				}
+				d.log.Debug("received message", zap.String("queue", queueName))
 
-				err := d.processQueue(queueNameFromMessage)
+				err := d.processQueue(ctx, queueName)
 				if err != nil {
-					d.handleProcessingError(err, queueNameFromMessage)
+					d.log.Error("failed to process durable queue after notification; next poll will retry", zap.Error(err))
 				}
 			case <-ticker.C:
 				d.log.Debug("ticker triggered, processing any pending tasks")
+				if messages == nil {
+					d.log.Debug("resubscribing to Redis notification channel", zap.String("channel", d.channel))
+					pubSub = d.rdb.Subscribe(ctx, d.channel)
+					messages = pubSub.Channel()
+				}
 
-				err := d.processQueue(queueName)
+				err := d.processQueue(ctx, queueName)
 				if err != nil {
-					d.handleProcessingError(err, queueName)
+					d.log.Error("failed to process durable queue; next poll will retry", zap.Error(err))
 				}
 			}
 
 		}
-	}()
+	}(listenerContext)
 }
 
-func (d *Driver) processQueue(queueName string) error {
-	queueKey := d.queuePrefix + "_" + queueName
+func (d *Driver) processQueue(ctx context.Context, queueName string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
 
-	for {
-		select {
-		case <-d.ctx.Done():
-			return d.ctx.Err()
-		default:
-			if d.priorityQueue.Len() >= uint64(d.prefetchLimit) {
-				time.Sleep(100 * time.Millisecond)
-				continue
+	if d.priorityQueue.Len() >= uint64(d.prefetchLimit) {
+		return nil
+	}
+
+	spaceAvailable := int64(d.prefetchLimit) - int64(d.priorityQueue.Len())
+	tasks, err := d.reserve(ctx, queueName, spaceAvailable)
+	if err != nil {
+		return err
+	}
+
+	if len(tasks) == 0 {
+		d.log.Debug("no tasks found in queue", zap.String("queue", queueName))
+		return nil
+	}
+
+	for _, task := range tasks {
+		var item Item
+		if unmarshalError := json.Unmarshal([]byte(task.payload), &item); unmarshalError != nil {
+			d.log.Error("task payload is malformed and was dead-lettered", zap.String("taskID", task.id), zap.Error(unmarshalError))
+			if discardError := d.discardMalformed(ctx, queueName, task.id); discardError != nil {
+				return discardError
 			}
-
-			spaceAvailable := int64(d.prefetchLimit) - int64(d.priorityQueue.Len())
-
-			tasks, err := d.rdb.ZPopMin(d.ctx, queueKey, spaceAvailable).Result()
-			if err != nil {
-				return err
-			}
-
-			if len(tasks) == 0 {
-				d.log.Debug("no tasks found in queue", zap.String("queue", queueName))
-				return nil
-			}
-
-			for _, task := range tasks {
-				taskID := task.Member.(string)
-
-				taskJson, err := d.rdb.Get(d.ctx, taskID).Result()
-				if err != nil {
-					d.log.Error("failed to fetch task payload", zap.String("taskID", taskID), zap.Error(err))
-					d.rdb.Del(d.ctx, taskID)
-					continue
-				}
-
-				var item Item
-
-				err = json.Unmarshal([]byte(taskJson), &item)
-				if err != nil {
-					d.log.Debug("Unmarshalling failed")
-					d.rdb.Del(d.ctx, taskID)
-					continue
-				}
-
-				d.addItemOptions(&item)
-				d.priorityQueue.Insert(&item)
-				d.log.Debug("task pushed to priority queue", zap.Uint64("queue size", d.priorityQueue.Len()))
-			}
+			continue
 		}
-	}
-}
 
-func (d *Driver) handleProcessingError(err error, queueName string) {
-	if errors.Is(err, context.Canceled) {
-		atomic.StoreUint32(&d.listeners, 0)
-		return
-	}
-
-	if errors.Is(err, redis.ErrClosed) {
-		if atomic.LoadUint32(&d.listeners) > 0 {
-			atomic.AddUint32(&d.listeners, ^uint32(0))
+		if item.ID() != task.id || item.Options == nil || item.GroupID() != queueName {
+			d.log.Error("task metadata is inconsistent and was dead-lettered", zap.String("taskID", task.id))
+			if discardError := d.discardMalformed(ctx, queueName, task.id); discardError != nil {
+				return discardError
+			}
+			continue
 		}
-		d.log.Debug("listener was stopped")
-		return
+
+		d.addItemRuntime(&item, task)
+		d.priorityQueue.Insert(&item)
+		d.log.Debug("task reserved and pushed to RoadRunner priority queue",
+			zap.String("taskID", task.id),
+			zap.Int("delivery", task.deliveries),
+			zap.Uint64("queue_size", d.priorityQueue.Len()),
+		)
 	}
 
-	atomic.StoreUint32(&d.listeners, 0)
-
-	if atomic.LoadUint64(&d.stopped) == 1 {
-		return
-	}
-
-	pipe := (*d.pipeline.Load()).Name()
-	d.eventsChannel <- events.NewEvent(events.EventJOBSDriverCommand, pipe, restartStr)
-	d.log.Error("process error, restarting the pipeline", zap.Error(err), zap.String("pipeline", pipe))
-}
-
-func (d *Driver) atomicCtx() {
-	d.ctx, d.cancel = context.WithCancel(context.Background())
-}
-
-func (d *Driver) checkCtxAndCancel() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if d.cancel != nil {
-		d.cancel()
-	}
+	return nil
 }
