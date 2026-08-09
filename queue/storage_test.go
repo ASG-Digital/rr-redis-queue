@@ -131,6 +131,31 @@ func TestReserveReturnsHighestPriorityTaskFirst(t *testing.T) {
 	}
 }
 
+func TestReservationLeaseStartsFromRedisExecutionTime(t *testing.T) {
+	driver, redisServer := newTestDriver(t)
+	redisNow := time.Date(2026, time.August, 9, 12, 0, 0, 0, time.UTC)
+	redisServer.SetTime(redisNow)
+	driver.visibilityLimit = 30
+
+	item := newTestItem("redis-time-lease")
+	storeTestItem(t, driver, item)
+	reserved := reserveOne(t, driver, item.GroupID())
+
+	leaseUntil, err := driver.rdb.ZScore(
+		context.Background(),
+		driver.keys(item.GroupID()).reserved,
+		reserved.ID(),
+	).Result()
+	if err != nil {
+		t.Fatalf("read reservation lease: %v", err)
+	}
+
+	expected := float64(redisNow.Add(30 * time.Second).UnixMilli())
+	if leaseUntil != expected {
+		t.Fatalf("expected lease expiry %.0f, got %.0f", expected, leaseUntil)
+	}
+}
+
 func TestAckRemovesAllActiveTaskDataIncludingAutoAck(t *testing.T) {
 	for _, autoAck := range []bool{false, true} {
 		t.Run(map[bool]string{false: "manual_ack", true: "auto_ack"}[autoAck], func(t *testing.T) {

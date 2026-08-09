@@ -66,16 +66,14 @@ func (d *Driver) reserve(ctx context.Context, pipeline string, limit int64) ([]r
 	}
 
 	keys := d.keys(pipeline)
-	now := time.Now()
-	leaseUntil := now.Add(time.Duration(d.visibilityLimit) * time.Second)
-	if err := d.cleanupExpiredDeadLetters(ctx, keys, now); err != nil {
+	if err := d.cleanupExpiredDeadLetters(ctx, keys, time.Now()); err != nil {
 		return nil, err
 	}
 
 	values, err := reserveScript.Run(ctx, d.rdb, []string{
 		keys.ready, keys.delayed, keys.reserved, keys.dead,
 		keys.priorities, keys.deliveries, keys.tokens,
-	}, now.UnixMilli(), leaseUntil.UnixMilli(), d.maxRetries, limit, d.deadLetterTTL).StringSlice()
+	}, d.visibilityLimit, d.maxRetries, limit, d.deadLetterTTL).StringSlice()
 	if err != nil {
 		return nil, err
 	}
