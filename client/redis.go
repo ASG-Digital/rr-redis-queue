@@ -19,7 +19,7 @@ func NewRedisClient(log *zap.Logger, cfg *Config) (redis.UniversalClient, error)
 		Password:         cfg.Password,
 		SentinelPassword: cfg.SentinelPassword,
 		MaxRetries:       cfg.MaxRetries,
-		MinRetryBackoff:  cfg.MaxRetryBackoff,
+		MinRetryBackoff:  cfg.MinRetryBackoff,
 		MaxRetryBackoff:  cfg.MaxRetryBackoff,
 		DialTimeout:      cfg.DialTimeout,
 		ReadTimeout:      cfg.ReadTimeout,

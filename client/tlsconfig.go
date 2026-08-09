@@ -3,8 +3,11 @@ package client
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"golang.org/x/sys/cpu"
+	"errors"
+	"fmt"
 	"os"
+
+	"golang.org/x/sys/cpu"
 )
 
 type TLSConfig struct {
@@ -17,13 +20,19 @@ func tlsConfig(conf *TLSConfig) (*tls.Config, error) {
 	if conf == nil {
 		return nil, nil
 	}
+	if (conf.Cert == "") != (conf.Key == "") {
+		return nil, errors.New("both TLS client certificate and key must be configured together")
+	}
+	if conf.Cert != "" {
+		if _, err := tls.LoadX509KeyPair(conf.Cert, conf.Key); err != nil {
+			return nil, fmt.Errorf("load TLS client certificate: %w", err)
+		}
+	}
 
 	tlsConfig := defaultTLSConfig(conf)
 	if conf.RootCa != "" {
-		// error is always nil here
 		certPool, err := x509.SystemCertPool()
 		if err != nil {
-			// error is always nil here
 			return nil, err
 		}
 
@@ -31,21 +40,16 @@ func tlsConfig(conf *TLSConfig) (*tls.Config, error) {
 			certPool = x509.NewCertPool()
 		}
 
-		// we already checked this file in the config.go
 		rca, err := os.ReadFile(conf.RootCa)
 		if err != nil {
 			return nil, err
 		}
 
 		if ok := certPool.AppendCertsFromPEM(rca); !ok {
-			return nil, err
+			return nil, errors.New("TLS root CA file does not contain a valid PEM certificate")
 		}
 
 		tlsConfig.RootCAs = certPool
-	}
-
-	if _, crtExistErr := os.Stat(conf.RootCa); crtExistErr != nil {
-		return nil, crtExistErr
 	}
 
 	return tlsConfig, nil

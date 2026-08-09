@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/redis/go-redis/v9"
-	"github.com/roadrunner-server/api/v4/plugins/v4/jobs"
-	"github.com/roadrunner-server/errors"
-	"go.uber.org/zap"
 	"maps"
 	"sync/atomic"
 	"time"
+
+	"github.com/roadrunner-server/api/v4/plugins/v4/jobs"
+	"github.com/roadrunner-server/errors"
+	"go.uber.org/zap"
 )
 
 var _ jobs.Job = (*Item)(nil)
@@ -21,19 +21,18 @@ type Item struct {
 	Payload    []byte              `json:"payload"`
 	HeadersMap map[string][]string `json:"headers,omitempty"`
 	Options    *Options            `json:"options,omitempty"`
+
+	deliveryToken string
+	deliveryCount int
+	driver        *Driver
 }
 
 type Options struct {
-	Priority  int64  `json:"priority"`
-	Pipeline  string `json:"pipeline,omitempty"`
-	Delay     int64  `json:"delay,omitempty"`
-	AutoAck   bool   `json:"auto_ack"`
-	Queue     string `json:"queue,omitempty"`
-	requeueFn func(ctx context.Context, item *Item) error
-	stopped   *uint64
-	rdb       redis.UniversalClient
-	ctx       context.Context
-	log       *zap.Logger
+	Priority int64  `json:"priority"`
+	Pipeline string `json:"pipeline,omitempty"`
+	Delay    int64  `json:"delay,omitempty"`
+	AutoAck  bool   `json:"auto_ack"`
+	Queue    string `json:"queue,omitempty"`
 }
 
 func (o *Options) DelayDuration() time.Duration {
@@ -79,52 +78,68 @@ func (i *Item) Context() ([]byte, error) {
 }
 
 func (i *Item) Ack() error {
-
-	if i.Options == nil {
-		return fmt.Errorf("ack failed: options are nil for item %s", i.Ident)
-	}
-	if i.Options.rdb == nil {
-		return fmt.Errorf("ack failed: Redis client is nil for item %s", i.Ident)
+	if err := i.ensureActive("acknowledge"); err != nil {
+		return err
 	}
 
-	if atomic.LoadUint64(i.Options.stopped) == 1 {
-		return errors.Str("failed to acknowledge the job, the pipeline is probably stopped")
+	result, err := i.driver.acknowledge(context.Background(), i)
+	if err != nil {
+		return errors.E(errors.Str("failed to acknowledge task in Redis"), err)
 	}
-	if i.Options.AutoAck {
+
+	if result == transitionResultNoop {
+		i.driver.log.Warn("stale acknowledgement ignored", zap.String("taskID", i.ID()))
 		return nil
 	}
 
-	err := i.Options.rdb.Del(i.Options.ctx, i.ID()).Err()
-	if err != nil {
-		return errors.E(errors.Str("failed to remove payload from Redis"), err)
-	}
-
-	i.Options.log.Warn("Task acknowledged and payload removed", zap.String("taskID", i.ID()))
+	i.driver.log.Debug("task acknowledged and payload removed", zap.String("taskID", i.ID()))
 	return nil
-
 }
 
 func (i *Item) Nack() error {
-	i.Options.log.Debug("Task negatively acknowledged with", zap.String("taskID", i.ID()))
-	if atomic.LoadUint64(i.Options.stopped) == 1 {
-		return errors.Str("failed to negatively acknowledge the job, the pipeline is probably stopped")
+	if err := i.ensureActive("negatively acknowledge"); err != nil {
+		return err
 	}
+
+	// RoadRunner uses Nack for worker allocation and protocol failures. Retry
+	// transient infrastructure failures without allowing a poison task to loop.
+	i.driver.log.Warn("task negatively acknowledged by RoadRunner; scheduling bounded retry",
+		zap.String("taskID", i.ID()),
+		zap.Int("delivery", i.deliveryCount),
+	)
+
+	return i.requeue(nil, i.driver.retryDelay)
+}
+
+func (i *Item) NackWithOptions(requeue bool, delay int) error {
+	if err := i.ensureActive("negatively acknowledge"); err != nil {
+		return err
+	}
+
+	if requeue {
+		return i.requeue(nil, delay)
+	}
+
+	result, err := i.driver.discard(context.Background(), i)
+	if err != nil {
+		return errors.E(errors.Str("failed to discard task in Redis"), err)
+	}
+	if result == transitionResultNoop {
+		i.driver.log.Warn("stale task discard ignored", zap.String("taskID", i.ID()))
+	}
+
 	return nil
 }
 
-func (i *Item) NackWithOptions(requeue bool, _ int) error {
-	i.Options.log.Debug("Task negatively acknowledged (with options) with", zap.String("taskID", i.ID()))
-	if requeue {
-		return i.Requeue(nil, 0)
+func (i *Item) Requeue(headers map[string][]string, delay int) error {
+	if err := i.ensureActive("requeue"); err != nil {
+		return err
 	}
-	return i.Nack()
+
+	return i.requeue(headers, delay)
 }
 
-func (i *Item) Requeue(headers map[string][]string, _ int) error {
-	if atomic.LoadUint64(i.Options.stopped) == 1 {
-		return errors.Str("failed to requeue the job, the pipeline is probably stopped")
-	}
-
+func (i *Item) requeue(headers map[string][]string, delay int) error {
 	if i.HeadersMap == nil {
 		i.HeadersMap = make(map[string][]string)
 	}
@@ -133,10 +148,12 @@ func (i *Item) Requeue(headers map[string][]string, _ int) error {
 		maps.Copy(i.HeadersMap, headers)
 	}
 
-	if i.Options.requeueFn != nil {
-		return i.Options.requeueFn(context.Background(), i)
+	if delay < 0 {
+		delay = 0
 	}
-	return nil
+	i.Options.Delay = int64(delay)
+
+	return i.driver.handleRequeue(context.Background(), i, delay)
 }
 
 func (i *Item) Respond(_ []byte, _ string) error {
@@ -163,12 +180,22 @@ func fromJob(job jobs.Message) *Item {
 	}
 }
 
-func (d *Driver) addItemOptions(
-	item *Item,
-) {
-	item.Options.rdb = d.rdb
-	item.Options.ctx = d.ctx
-	item.Options.log = d.log
-	item.Options.requeueFn = d.handleRequeue
-	item.Options.stopped = &d.stopped
+func (i *Item) ensureActive(operation string) error {
+	if i.Options == nil {
+		return fmt.Errorf("cannot %s task %s: options are nil", operation, i.Ident)
+	}
+	if i.driver == nil {
+		return fmt.Errorf("cannot %s task %s: driver is nil", operation, i.Ident)
+	}
+	if atomic.LoadUint64(&i.driver.stopped) == 1 {
+		return fmt.Errorf("cannot %s task %s: pipeline is stopped", operation, i.Ident)
+	}
+
+	return nil
+}
+
+func (d *Driver) addItemRuntime(item *Item, reserved reservedItem) {
+	item.driver = d
+	item.deliveryToken = reserved.token
+	item.deliveryCount = reserved.deliveries
 }
